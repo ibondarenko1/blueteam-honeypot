@@ -51,6 +51,11 @@ $Config = @{
     # Scan detection threshold (connections per minute)
     ScanThreshold    = 5
     
+    # IPS — Auto-block settings
+    IPSEnabled       = $true          # Set to $false to disable auto-blocking (IDS only)
+    BlockedIPs       = "C:\Honeypot\Logs\blocked_ips.log"
+    WhitelistIPs     = @("127.0.0.1", "::1")  # Never block these IPs — add your own IP here!
+    
     # Fake credentials to plant in logs
     FakeCredentials  = @(
         @{User="admin";     Pass="Admin@2024!";    Service="RDP"},
@@ -99,6 +104,83 @@ function Write-Alert {
 }
 
 # ─────────────────────────────────────────────
+#  IPS — AUTO BLOCK
+# ─────────────────────────────────────────────
+function Block-AttackerIP {
+    param([string]$IP, [string]$Reason)
+    
+    # Skip if IPS disabled
+    if (-not $Config.IPSEnabled) { return }
+    
+    # Skip whitelisted IPs
+    if ($Config.WhitelistIPs -contains $IP) {
+        Write-Alert "IP $IP is whitelisted — skipping block" "INFO"
+        return
+    }
+    
+    # Check if already blocked
+    $alreadyBlocked = Get-NetFirewallRule -DisplayName "BLUETEAM_BLOCK_$IP" -ErrorAction SilentlyContinue
+    if ($alreadyBlocked) { return }
+    
+    try {
+        # Block inbound traffic from attacker IP
+        New-NetFirewallRule `
+            -DisplayName "BLUETEAM_BLOCK_$IP" `
+            -Description "Auto-blocked by Blue Team Honeypot: $Reason" `
+            -Direction Inbound `
+            -RemoteAddress $IP `
+            -Action Block `
+            -Enabled True `
+            -ErrorAction Stop | Out-Null
+        
+        # Also block outbound (prevent reverse shells)
+        New-NetFirewallRule `
+            -DisplayName "BLUETEAM_BLOCK_OUT_$IP" `
+            -Description "Auto-blocked outbound by Blue Team Honeypot" `
+            -Direction Outbound `
+            -RemoteAddress $IP `
+            -Action Block `
+            -Enabled True `
+            -ErrorAction SilentlyContinue | Out-Null
+        
+        # Log the block
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $logDir = Split-Path $Config.BlockedIPs -Parent
+        if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+        Add-Content -Path $Config.BlockedIPs -Value "[$timestamp] BLOCKED: $IP | Reason: $Reason"
+        
+        Write-Alert "🚫 IPS AUTO-BLOCKED: $IP | Reason: $Reason" "CRITICAL"
+        
+    } catch {
+        Write-Alert "IPS block failed for $IP — $_" "WARNING"
+    }
+}
+
+function Unblock-IP {
+    param([string]$IP)
+    Remove-NetFirewallRule -DisplayName "BLUETEAM_BLOCK_$IP" -ErrorAction SilentlyContinue
+    Remove-NetFirewallRule -DisplayName "BLUETEAM_BLOCK_OUT_$IP" -ErrorAction SilentlyContinue
+    Write-Alert "IP $IP unblocked" "INFO"
+}
+
+function Show-BlockedIPs {
+    Write-Host "`n  [IPS] Currently Blocked IPs:" -ForegroundColor Yellow
+    $rules = Get-NetFirewallRule -DisplayName "BLUETEAM_BLOCK_*" -ErrorAction SilentlyContinue |
+             Where-Object { $_.Direction -eq "Inbound" }
+    
+    if (-not $rules) {
+        Write-Host "    No IPs currently blocked." -ForegroundColor Gray
+        return
+    }
+    
+    foreach ($rule in $rules) {
+        $ip = ($rule | Get-NetFirewallAddressFilter).RemoteAddress
+        Write-Host "    🚫 $ip — $($rule.Description)" -ForegroundColor Red
+    }
+    Write-Host "    Total blocked: $($rules.Count)" -ForegroundColor White
+}
+
+# ─────────────────────────────────────────────
 #  1. HONEYPOT PORT LISTENERS
 # ─────────────────────────────────────────────
 function Deploy-PortHoneypots {
@@ -133,6 +215,14 @@ function Deploy-PortHoneypots {
                         $level = if ($connections[$ip][$minute] -ge $threshold) { "CRITICAL" } else { "TRAP" }
                         $msg = "[$time] [$level] HONEYPOT HIT Port:$p | Source: $ip | Connections this minute: $($connections[$ip][$minute])"
                         Add-Content -Path $logPath -Value $msg
+                        
+                        # IPS: auto-block after repeated hits
+                        if ($connections[$ip][$minute] -ge $threshold -and $using:Config.IPSEnabled) {
+                            $blockLog = $using:Config.BlockedIPs
+                            $blockDir = Split-Path $blockLog -Parent
+                            if (-not (Test-Path $blockDir)) { New-Item -ItemType Directory -Path $blockDir -Force | Out-Null }
+                            Add-Content -Path $logPath -Value "[$time] [IPS] AUTO-BLOCK QUEUED: $ip (repeated honeypot hits)"
+                        }
                         
                         # Send fake banner based on port
                         $banner = switch ($p) {
@@ -203,7 +293,26 @@ function Deploy-ScanDetector {
                         $ports = $connectionTracker[$key] -join ","
                         $msg = "[$time] [CRITICAL] PORT SCAN DETECTED | Source: $ip | Ports scanned: $ports"
                         Add-Content -Path $logPath -Value $msg
-                        $connectionTracker[$key] = [System.Collections.Generic.List[int]]::new() # Reset
+                        
+                        # IPS: auto-block scanner via Windows Firewall
+                        try {
+                            $alreadyBlocked = Get-NetFirewallRule -DisplayName "BLUETEAM_BLOCK_$ip" -ErrorAction SilentlyContinue
+                            if (-not $alreadyBlocked -and $ip -notin @("127.0.0.1","::1")) {
+                                New-NetFirewallRule -DisplayName "BLUETEAM_BLOCK_$ip" `
+                                    -Description "Auto-blocked: Port scan detected" `
+                                    -Direction Inbound -RemoteAddress $ip -Action Block -Enabled True `
+                                    -ErrorAction SilentlyContinue | Out-Null
+                                New-NetFirewallRule -DisplayName "BLUETEAM_BLOCK_OUT_$ip" `
+                                    -Description "Auto-blocked outbound" `
+                                    -Direction Outbound -RemoteAddress $ip -Action Block -Enabled True `
+                                    -ErrorAction SilentlyContinue | Out-Null
+                                Add-Content -Path $logPath -Value "[$time] [IPS] 🚫 AUTO-BLOCKED: $ip (port scan)"
+                                $blockLog = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($logPath), "blocked_ips.log")
+                                Add-Content -Path $blockLog -Value "[$time] BLOCKED: $ip | Reason: Port scan ($ports)"
+                            }
+                        } catch { }
+                        
+                        $connectionTracker[$key] = [System.Collections.Generic.List[int]]::new()
                     }
                 }
                 
@@ -351,7 +460,24 @@ function Deploy-SMBHoneypot {
                         $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                         $logDir = Split-Path $logPath -Parent
                         if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-                        Add-Content -Path $logPath -Value "[$time] [CRITICAL] SMB HONEYPOT ACCESSED: \\$shareName | $($evt.Message -replace '\s+', ' ')"
+                        
+                        # Extract source IP from event
+                        $srcIP = if ($evt.Message -match 'Source Address:\s+(\S+)') { $matches[1] } else { "unknown" }
+                        Add-Content -Path $logPath -Value "[$time] [CRITICAL] SMB HONEYPOT ACCESSED: \\$shareName | Source: $srcIP"
+                        
+                        # IPS: auto-block
+                        if ($srcIP -ne "unknown" -and $srcIP -notin @("127.0.0.1","::1")) {
+                            try {
+                                $alreadyBlocked = Get-NetFirewallRule -DisplayName "BLUETEAM_BLOCK_$srcIP" -ErrorAction SilentlyContinue
+                                if (-not $alreadyBlocked) {
+                                    New-NetFirewallRule -DisplayName "BLUETEAM_BLOCK_$srcIP" `
+                                        -Description "Auto-blocked: SMB honeypot access" `
+                                        -Direction Inbound -RemoteAddress $srcIP -Action Block -Enabled True `
+                                        -ErrorAction SilentlyContinue | Out-Null
+                                    Add-Content -Path $logPath -Value "[$time] [IPS] 🚫 AUTO-BLOCKED: $srcIP (SMB honeypot)"
+                                }
+                            } catch { }
+                        }
                     }
                 }
                 $lastCheck = Get-Date
@@ -481,11 +607,20 @@ function Show-Status {
         $critAlerts   = (Select-String -Path $Config.AlertLog -Pattern "CRITICAL").Count
         $trapAlerts   = (Select-String -Path $Config.AlertLog -Pattern "TRAP").Count
         $scanAlerts   = (Select-String -Path $Config.AlertLog -Pattern "PORT SCAN").Count
+        $ipsBlocks    = (Select-String -Path $Config.AlertLog -Pattern "AUTO-BLOCKED").Count
         Write-Host "    Total Alerts   : $allAlerts" -ForegroundColor White
         Write-Host "    Critical       : $critAlerts" -ForegroundColor Red
         Write-Host "    Trap Hits      : $trapAlerts" -ForegroundColor Magenta
         Write-Host "    Port Scans     : $scanAlerts" -ForegroundColor Yellow
+        Write-Host "    IPS Blocks     : $ipsBlocks" -ForegroundColor Cyan
     }
+    
+    # IPS Status
+    Write-Host "`n  IPS Status:" -ForegroundColor Yellow
+    $ipsStatus = if ($Config.IPSEnabled) { "✓ ENABLED (auto-blocking ON)" } else { "✗ DISABLED (IDS only)" }
+    $ipsColor  = if ($Config.IPSEnabled) { "Green" } else { "Yellow" }
+    Write-Host "    $ipsStatus" -ForegroundColor $ipsColor
+    Show-BlockedIPs
 }
 
 # ─────────────────────────────────────────────
@@ -525,6 +660,8 @@ function Show-Menu {
     Write-Host "  [3] Show Status              — Check all trap status" -ForegroundColor Cyan
     Write-Host "  [4] Cleanup All Traps        — Remove everything" -ForegroundColor Cyan
     Write-Host "  [5] Deploy Individual Traps  — Choose specific traps" -ForegroundColor Cyan
+    Write-Host "  [6] Show Blocked IPs         — IPS block list" -ForegroundColor Cyan
+    Write-Host "  [7] Unblock an IP            — Remove firewall block" -ForegroundColor Cyan
     Write-Host "  [Q] Quit`n" -ForegroundColor Gray
     
     $choice = Read-Host "  Select option"
@@ -535,6 +672,8 @@ function Show-Menu {
         "3" { Show-Status }
         "4" { Start-Cleanup }
         "5" { Show-IndividualMenu }
+        "6" { Show-BlockedIPs; Write-Host "`n  Press any key..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown"); Show-Menu }
+        "7" { $ip = Read-Host "  Enter IP to unblock"; Unblock-IP $ip; Start-Sleep 1; Show-Menu }
         "Q" { exit }
         default { Write-Host "  Invalid option." -ForegroundColor Red; Start-Sleep 1; Show-Menu }
     }

@@ -10,6 +10,8 @@ TRIPWIRE_DIR="$HONEYPOT_DIR/tripwires"
 SMB_SHARE_DIR="$HONEYPOT_DIR/fakeshare"
 HONEYPOT_PORTS=(21 23 2222 8080 1433 3306)
 SCAN_THRESHOLD=5
+IPS_ENABLED=true
+WHITELIST_IPS=("127.0.0.1" "::1")  # Add your own IP here!
 PID_FILE="$HONEYPOT_DIR/honeypot.pids"
 
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
@@ -31,6 +33,44 @@ log_alert() {
     local ts=$(date '+%Y-%m-%d %H:%M:%S')
     mkdir -p "$(dirname $LOG_FILE)"
     echo "[$ts] [$level] $msg" | tee -a "$LOG_FILE"
+}
+
+# IPS — AUTO BLOCK
+block_ip() {
+    local ip="$1"; local reason="$2"
+    [ "$IPS_ENABLED" != "true" ] && return
+    
+    # Check whitelist
+    for w in "${WHITELIST_IPS[@]}"; do
+        [ "$ip" = "$w" ] && return
+    done
+    
+    # Check if already blocked
+    iptables -C INPUT -s "$ip" -j DROP 2>/dev/null && return
+    
+    # Block inbound and outbound
+    iptables -I INPUT  -s "$ip" -j DROP 2>/dev/null
+    iptables -I OUTPUT -d "$ip" -j DROP 2>/dev/null
+    
+    local ts=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$ts] BLOCKED: $ip | Reason: $reason" >> "$HONEYPOT_DIR/logs/blocked_ips.log"
+    log_alert "IPS" "🚫 AUTO-BLOCKED: $ip | Reason: $reason"
+}
+
+unblock_ip() {
+    local ip="$1"
+    iptables -D INPUT  -s "$ip" -j DROP 2>/dev/null
+    iptables -D OUTPUT -d "$ip" -j DROP 2>/dev/null
+    log_alert "INFO" "IP $ip unblocked"
+}
+
+show_blocked() {
+    echo -e "\n  ${YELLOW}[IPS] Currently Blocked IPs:${NC}"
+    if [ -f "$HONEYPOT_DIR/logs/blocked_ips.log" ]; then
+        cat "$HONEYPOT_DIR/logs/blocked_ips.log"
+    else
+        echo "  No IPs blocked yet."
+    fi
 }
 
 # 1. PORT HONEYPOTS
@@ -62,6 +102,7 @@ deploy_port_honeypots() {
                 src_ip=$(echo "$conn" | grep -oP 'connect to \[\K[^\]]+' | head -1)
                 [ -z "$src_ip" ] && src_ip="unknown"
                 log_alert "TRAP" "HONEYPOT HIT Port:$port | Source: $src_ip"
+                [ "$src_ip" != "unknown" ] && block_ip "$src_ip" "Honeypot port $port hit"
             fi
         done) &
         echo $! >> "$PID_FILE"
@@ -88,6 +129,7 @@ deploy_scan_detector() {
             if echo "$line" | grep -q "PORTSCAN"; then
                 src=$(echo "$line" | grep -oP 'SRC=\K\S+')
                 log_alert "CRITICAL" "PORT SCAN DETECTED | Source: $src | $line"
+                [ -n "$src" ] && block_ip "$src" "Port scan detected"
             fi
         done &
         echo $! >> "$PID_FILE"
@@ -357,17 +399,21 @@ deploy_all() {
 
 # ENTRY POINT
 case "${1:-menu}" in
-    deploy)  deploy_all ;;
-    monitor) monitor ;;
-    status)  status ;;
-    cleanup) cleanup ;;
+    deploy)   deploy_all ;;
+    monitor)  monitor ;;
+    status)   status ;;
+    cleanup)  cleanup ;;
+    blocked)  show_blocked ;;
+    unblock)  unblock_ip "$2" ;;
     menu|*)
         banner
         echo -e "  ${CYAN}Usage:${NC}"
-        echo "    sudo ./BlueTeam-Honeypot.sh deploy   — Deploy all traps"
-        echo "    sudo ./BlueTeam-Honeypot.sh monitor  — Live alert dashboard"
-        echo "    sudo ./BlueTeam-Honeypot.sh status   — Check trap status"
-        echo "    sudo ./BlueTeam-Honeypot.sh cleanup  — Remove all traps"
+        echo "    sudo ./BlueTeam-Honeypot.sh deploy          — Deploy all traps"
+        echo "    sudo ./BlueTeam-Honeypot.sh monitor         — Live alert dashboard"
+        echo "    sudo ./BlueTeam-Honeypot.sh status          — Check trap status"
+        echo "    sudo ./BlueTeam-Honeypot.sh blocked         — Show blocked IPs"
+        echo "    sudo ./BlueTeam-Honeypot.sh unblock <IP>    — Unblock an IP"
+        echo "    sudo ./BlueTeam-Honeypot.sh cleanup         — Remove all traps"
         echo ""
         ;;
 esac
