@@ -1,4 +1,4 @@
-.............# 🛡️ Blue Team Honeypot & Trap Toolkit
+..............# 🛡️ Blue Team Honeypot & Trap Toolkit
 
 **Summit Range Consulting** — CTF / Blue Team Challenge Edition
 
