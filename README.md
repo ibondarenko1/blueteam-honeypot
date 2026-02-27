@@ -73,4 +73,4 @@ yum install ncat inotify-tools samba     # RHEL/CentOS
 
 ---
 
-*Summit Range Consulting | WOSB Certified | Built for Blue Team CTF Defense*
+*Summit Range Consulting | Built for Blue Team CTF Defense*
